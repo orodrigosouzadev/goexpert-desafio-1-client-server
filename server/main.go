@@ -37,9 +37,20 @@ func main() {
 
 func GetQuotationHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
+	httpCtx := context.Background()
+	httpCtx, cancelHttpCtx := context.WithTimeout(httpCtx, time.Millisecond*300)
+	defer cancelHttpCtx()
+
+	dbCtx := context.Background()
+	dbCtx, cancelDbCtx := context.WithTimeout(dbCtx, time.Millisecond*10)
+	defer cancelDbCtx()
+
 	select {
 	case <-ctx.Done():
-		w.WriteHeader(http.StatusInternalServerError)
+		cancelHttpCtx()
+		cancelDbCtx()
+		w.WriteHeader(http.StatusRequestTimeout)
 		return
 	default:
 		if r.URL.Path != "/cotacao" {
@@ -47,26 +58,32 @@ func GetQuotationHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		quotation, err := GetQuotation()
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
+		select {
+		case <-httpCtx.Done():
+			w.WriteHeader(http.StatusRequestTimeout)
 			return
+		default:
+			quotation, err := GetQuotation(httpCtx)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
+			select {
+			case <-httpCtx.Done():
+				w.WriteHeader(http.StatusRequestTimeout)
+				return
+			default:
+				SaveQuotation(dbCtx, quotation)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(quotation.Bid)
 		}
-
-		SaveQuotation(quotation)
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-
-		json.NewEncoder(w).Encode(quotation.Bid)
 	}
 }
 
-func GetQuotation() (*Quotation, error) {
-	ctx := context.Background()
-	ctx, cancel := context.WithTimeout(ctx, time.Millisecond*200)
-	defer cancel()
-
+func GetQuotation(ctx context.Context) (*Quotation, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", "https://economia.awesomeapi.com.br/json/last/USD-BRL", nil)
 	if err != nil {
 		return nil, err
@@ -91,16 +108,12 @@ func GetQuotation() (*Quotation, error) {
 	return &quotation.USDBRL, nil
 }
 
-func SaveQuotation(quotation *Quotation) error {
+func SaveQuotation(ctx context.Context, quotation *Quotation) error {
 	db, err := sql.Open("sqlite3", "./quotations.db")
 	if err != nil {
 		panic(err)
 	}
 	defer db.Close()
-
-	ctx := context.Background()
-	ctx, cancel := context.WithTimeout(ctx, time.Millisecond*10)
-	defer cancel()
 
 	stmt, err := db.Prepare(`
 		insert into quotation(id, code, code_in, name, high, low, var_bid, pct_change, bid, ask, timestamp, created_date) 
