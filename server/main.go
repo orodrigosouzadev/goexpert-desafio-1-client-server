@@ -2,14 +2,13 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"io"
 	"net/http"
 	"time"
 
-	"github.com/google/uuid"
-	_ "github.com/mattn/go-sqlite3"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 )
 
 type Quotation struct {
@@ -38,18 +37,8 @@ func main() {
 func GetQuotationHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	httpCtx := context.Background()
-	httpCtx, cancelHttpCtx := context.WithTimeout(httpCtx, time.Millisecond*300)
-	defer cancelHttpCtx()
-
-	dbCtx := context.Background()
-	dbCtx, cancelDbCtx := context.WithTimeout(dbCtx, time.Millisecond*10)
-	defer cancelDbCtx()
-
 	select {
 	case <-ctx.Done():
-		cancelHttpCtx()
-		cancelDbCtx()
 		w.WriteHeader(http.StatusRequestTimeout)
 		return
 	default:
@@ -58,33 +47,28 @@ func GetQuotationHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		select {
-		case <-httpCtx.Done():
-			w.WriteHeader(http.StatusRequestTimeout)
-			return
-		default:
-			quotation, err := GetQuotation(httpCtx)
-			if err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-
-			select {
-			case <-httpCtx.Done():
-				w.WriteHeader(http.StatusRequestTimeout)
-				return
-			default:
-				SaveQuotation(dbCtx, quotation)
-			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			json.NewEncoder(w).Encode(quotation.Bid)
+		quotation, err := GetQuotation()
+		if err != nil {
+			panic(err)
 		}
+
+		err = SaveQuotation(quotation)
+		if err != nil {
+			panic(err)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(quotation.Bid)
 	}
 }
 
-func GetQuotation(ctx context.Context) (*Quotation, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", "https://economia.awesomeapi.com.br/json/last/USD-BRL", nil)
+func GetQuotation() (*Quotation, error) {
+	httpCtx := context.Background()
+	httpCtx, cancelHttpCtx := context.WithTimeout(httpCtx, time.Millisecond*200)
+	defer cancelHttpCtx()
+
+	req, err := http.NewRequestWithContext(httpCtx, "GET", "https://economia.awesomeapi.com.br/json/last/USD-BRL", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -108,36 +92,19 @@ func GetQuotation(ctx context.Context) (*Quotation, error) {
 	return &quotation.USDBRL, nil
 }
 
-func SaveQuotation(ctx context.Context, quotation *Quotation) error {
-	db, err := sql.Open("sqlite3", "./quotations.db")
+func SaveQuotation(quotation *Quotation) error {
+	dbCtx := context.Background()
+	dbCtx, cancelDbCtx := context.WithTimeout(dbCtx, time.Nanosecond*10)
+	defer cancelDbCtx()
+
+	db, err := gorm.Open(sqlite.Open("quotations.db"), &gorm.Config{})
 	if err != nil {
 		panic(err)
 	}
-	defer db.Close()
 
-	stmt, err := db.Prepare(`
-		insert into quotation(id, code, code_in, name, high, low, var_bid, pct_change, bid, ask, timestamp, created_date) 
-		values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
+	db.AutoMigrate(&Quotation{})
 
-	_, err = stmt.ExecContext(ctx,
-		uuid.New().String(),
-		quotation.Code,
-		quotation.CodeIn,
-		quotation.Name,
-		quotation.High,
-		quotation.Low,
-		quotation.VarBid,
-		quotation.PctChange,
-		quotation.Bid,
-		quotation.Ask,
-		quotation.Timestamp,
-		quotation.CreateDate,
-	)
+	err = db.WithContext(dbCtx).Create(&quotation).Error
 	if err != nil {
 		return err
 	}
